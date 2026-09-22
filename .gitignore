@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地实际配置（仅提交示例文件 config.example.json）
+config.json

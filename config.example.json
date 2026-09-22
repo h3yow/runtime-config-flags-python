@@ -1,0 +1,17 @@
+{
+  "settings": {
+    "service_name": "demo-service",
+    "max_connections": 100,
+    "request_timeout_ms": 2000,
+    "enable_cache": true,
+    "api_base_url": "https://api.example.com",
+    "secret_token": "replace-me-in-real-deployment"
+  },
+  "flags": {
+    "new_checkout": {
+      "enabled": true,
+      "rollout": { "percentage": 25, "salt": "new_checkout" }
+    },
+    "legacy_mode": { "enabled": false }
+  }
+}
