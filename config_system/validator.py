@@ -68,6 +68,9 @@ def dataclasses_asdict(obj: Any) -> dict[str, Any]:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, frozenset):
+        # 名单规范化为排序列表，保证内容相同则版本号相同
+        return sorted(value)
     return value
 
 
@@ -142,5 +145,33 @@ def _validate_flags(raw_flags: dict[str, Any], schema: ConfigSchema) -> dict[str
         if percentage != -1 and not (0 <= percentage <= 100):
             raise ConfigRejectionError(RejectionReason.ILLEGAL_VALUE, f"{path}.percentage",
                                        f"灰度比例 {percentage} 不在 0-100")
-        out[name] = FlagState(name=name, enabled=enabled, percentage=percentage)
+        global_off = val.get("global_off", False)
+        if not isinstance(global_off, bool):
+            raise ConfigRejectionError(RejectionReason.TYPE_MISMATCH, f"{path}.global_off",
+                                       f"期望 bool，实际 {type(global_off).__name__}")
+        force_on = _check_subject_list(val.get("force_on", []), f"{path}.force_on")
+        force_off = _check_subject_list(val.get("force_off", []), f"{path}.force_off")
+        out[name] = FlagState(
+            name=name,
+            enabled=enabled,
+            percentage=percentage,
+            global_off=global_off,
+            force_on=force_on,
+            force_off=force_off,
+        )
     return out
+
+
+def _check_subject_list(raw: Any, path: str) -> frozenset[str]:
+    """校验名单：必须是数组，且每个元素都是字符串；重复元素去重。"""
+    if not isinstance(raw, list):
+        raise ConfigRejectionError(RejectionReason.TYPE_MISMATCH, path,
+                                   f"期望数组(list)，实际 {type(raw).__name__}")
+    subjects: set[str] = set()
+    for idx, item in enumerate(raw):
+        if not isinstance(item, str):
+            raise ConfigRejectionError(
+                RejectionReason.TYPE_MISMATCH, f"{path}[{idx}]",
+                f"名单主体必须是字符串，实际 {type(item).__name__}")
+        subjects.add(item)
+    return frozenset(subjects)

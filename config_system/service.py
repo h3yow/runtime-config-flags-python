@@ -6,6 +6,7 @@ import logging
 import os
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 from .errors import ConfigRejectionError
@@ -31,6 +32,11 @@ APP_SCHEMA = ConfigSchema(
 def build_default_manager() -> ConfigManager:
     file_path = os.environ.get("APP_CONFIG_FILE", "config.json")
     return ConfigManager(APP_SCHEMA, file_path=file_path)
+
+
+class BatchFlagRequest(BaseModel):
+    # 显式要求 list[str]：标量等错误形状由 pydantic 统一拒绝（422）
+    subjects: list[str]
 
 
 def create_app(manager: ConfigManager | None = None) -> FastAPI:
@@ -80,5 +86,20 @@ def create_app(manager: ConfigManager | None = None) -> FastAPI:
                     decision["version"], name, subject,
                     decision["enabled"], decision["reason"])
         return decision
+
+    @app.post("/flags/{name}/batch")
+    def eval_flag_batch(name: str, req: BatchFlagRequest):
+        """批量判定：整批一次取快照，结果全部基于同一配置版本。
+
+        空批次返回空 results；重复主体逐个返回（结果一致），顺序与请求一致。
+        """
+        snap = mgr.current()
+        result = snap.decide_batch(name, req.subjects)
+        reasons: dict[str, int] = {}
+        for item in result["results"]:
+            reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        logger.info("flag batch decide: version=%s flag=%s count=%s reasons=%s",
+                    result["version"], name, result["count"], reasons)
+        return result
 
     return app
