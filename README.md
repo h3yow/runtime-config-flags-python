@@ -55,7 +55,76 @@ bucket = sha256("{salt}|{flag}|{subject}")[:16] % 100   # 0-99 共 100 桶
 
 - **稳定可复现**：同一主体在同一配置版本下判定恒定；盐（salt）为部署级常量、与版本号解耦，因此修改无关字段不会导致分组漂移。
 - **比例平滑**：按“桶位 < 比例”的前缀判定，比例从 p1 调大到 p2 时仅新增桶位 `[p1, p2)` 的主体，已开启者不被踢出，无大面积重新分组。
-- **可解释**：`GET /flags/{name}?subject=xxx` 返回 `version / enabled / reason / bucket / percentage`，`reason` 取值：`boolean_on`、`boolean_off`、`rollout_in`、`rollout_out`、`unknown_flag`。
+- **可解释**：`GET /flags/{name}?subject=xxx` 返回 `version / enabled / reason / bucket / percentage`。
+- **纯布尔开关**：`percentage` 缺省（-1）时按 `enabled` 整体开/关，`reason` 为 `boolean_on / boolean_off`。
+
+## 强制名单与一键全量关
+
+每个灰度开关在 `enabled + percentage` 之外还支持三个字段（均可选，老配置缺省行为不变）：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `force_on` | `string[]` | 强制打开名单：命中即开，与比例无关 |
+| `force_off` | `string[]` | 强制关闭名单：命中即关，与比例无关 |
+| `kill_switch` | `bool` | 一键全量关：`true` 时对所有主体一律关闭 |
+
+灰度模式下判定优先级**从高到低**固定为：
+
+```
+1. kill_switch 整体关闭   -> enabled=false, reason=kill_switch   （忽略比例与名单）
+2. force_off 强制关闭名单 -> enabled=false, reason=force_off
+3. force_on  强制打开名单 -> enabled=true,  reason=force_on
+4. 稳定桶位比例判定       -> reason=rollout_in / rollout_out
+```
+
+由此保证的确定性语义：
+
+- **整体关闭优先级最高**：即使 `percentage=100` 且主体在 `force_on` 名单里，只要 `kill_switch=true` 一律关闭，且 `reason` 明确为 `kill_switch`，不会与“比例没选中”混淆；解除后恢复比例判定。
+- **冲突以关闭为准**：主体同时出现在两个名单里时结果恒为 `force_off`，不会反复横跳。
+- **名单稳定命中**：名单主体不受比例调整影响；比例调大只按前缀桶放入新主体，名单外已开启者不会被踢出。
+- **边界确定**：`percentage=0`（无名单、未整体关）对普通主体恒为 `rollout_out`，`percentage=100` 恒为 `rollout_in`；叠加 `kill_switch` / 名单后按上表优先级得到唯一结果。
+- **纯布尔开关不参与上述机制**：`percentage` 缺省的开关仍只看 `enabled`。
+
+名单本身写坏时（名单不是数组、元素不是字符串、`kill_switch` 不是布尔值、或写到了未声明的开关上），整次更新以 `422 type_mismatch` / `invalid_key` 拒绝，服务继续沿用上一个好版本，不会只生效一半。
+
+```json
+{
+  "flags": {
+    "new_ui": {
+      "enabled": true,
+      "percentage": 30,
+      "force_on": ["vip-001", "vip-002"],
+      "force_off": ["blocked-007"],
+      "kill_switch": false
+    }
+  }
+}
+```
+
+## 批量判定
+
+`POST /flags/{name}/batch`，请求体 `{"subjects": ["user-1", "user-2", ...]}`：
+
+- **版本一致性**：请求进入处理时只取一次当前不可变快照，整批基于同一配置版本出结果；返回顶层与每条结果都带同一个 `version`，并给出该主体命中的规则（`rollout_in / rollout_out / force_on / force_off / kill_switch / unknown_flag`）。处理期间即使发生热更新，这一批也不会一半旧版本一半新版本。
+- **空批次**：`subjects: []` 返回 `200` 与空 `results`（顶层仍带当前版本号）。
+- **重复主体**：按入参顺序为每次出现各返回一条，同一主体的结果必然一致；桶位按主体缓存，重复主体不会重复计算。
+- **规模**：单次哈希仅一次 SHA-256，判定为集合成员判断，5000 主体为毫秒级；重复主体越多缓存收益越大，耗时随主体数近似线性，不会越批量越慢得离谱。
+- **非法入参**：`subjects` 缺失、不是数组或元素不是字符串时返回 `422`，不做隐式类型转换。
+
+```
+POST /flags/new_ui/batch  {"subjects": ["vip-001", "user-1", "blocked-007"]}
+-> {"version": "ab12...", "flag": "new_ui", "results": [
+     {"version": "ab12...", "flag": "new_ui", "enabled": true,  "reason": "force_on",   ...},
+     {"version": "ab12...", "flag": "new_ui", "enabled": false, "reason": "rollout_out", ...},
+     {"version": "ab12...", "flag": "new_ui", "enabled": false, "reason": "force_off",  ...}
+   ]}
+```
+
+## 兼容性
+
+- **老配置**：不含 `force_on / force_off / kill_switch` 的配置文件与环境变量层无需改动；三个字段缺省为空名单 / `false`，灰度与纯布尔开关行为与旧版完全一致（既有 39 个用例全部保留通过）。
+- **老接口**：`GET /flags/{name}`、`/config*` 的路径、方法与既有字段不变；单主体判定的旧 `reason`（`boolean_on/off`、`rollout_in/out`、`unknown_flag`）含义不变，本次仅**新增** `force_on / force_off / kill_switch` 三种 reason。`GET /config` 的开关视图额外带出三个新字段。
+- **环境变量层**：暂不支持通过环境变量设置名单（名单为数组形态），名单通过配置文件配置；`APP_FLAG_* / APP_ROLLOUT_*` 语义不变。
 
 ## HTTP 接口
 
@@ -67,6 +136,7 @@ bucket = sha256("{salt}|{flag}|{subject}")[:16] % 100   # 0-99 共 100 桶
 | POST | `/config/reload` | 热更新；失败 422 + 可区分原因 |
 | POST | `/config/rollback` | 回滚到上一可用版本 |
 | GET | `/flags/{name}?subject=` | 开关判定（含版本与判定依据） |
+| POST | `/flags/{name}/batch` | 批量判定，整批同版本（body：`{"subjects": [...]}`） |
 
 ## 本地验证
 
@@ -87,6 +157,37 @@ curl 'localhost:8000/flags/new_ui?subject=user-1'
 echo '{"fields": {"limit": "bad"}}' > config.json
 curl -X POST localhost:8000/config/reload   # 422 type_mismatch
 curl localhost:8000/config/status           # 查看 last_rejection
+
+# 验证强制名单、整体关闭与批量判定
+cat > config.json <<'JSON'
+{
+  "flags": {
+    "new_ui": {
+      "enabled": true, "percentage": 30,
+      "force_on": ["vip-001"],
+      "force_off": ["blocked-007", "vip-001"],
+      "kill_switch": false
+    }
+  }
+}
+JSON
+curl -X POST localhost:8000/config/reload
+curl 'localhost:8000/flags/new_ui?subject=vip-001'      # force_off（同时在两名单，关闭优先）
+curl 'localhost:8000/flags/new_ui?subject=blocked-007'  # force_off
+curl 'localhost:8000/flags/new_ui?subject=user-1'       # rollout_in / rollout_out
+curl -X POST localhost:8000/flags/new_ui/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"subjects": ["vip-001", "user-1", "blocked-007"]}'   # 三条 reason，同一个 version
+
+# 一键全量关：改 kill_switch=true 后 reload，所有主体都是 kill_switch
+sed -i 's/"kill_switch": false/"kill_switch": true/' config.json
+curl -X POST localhost:8000/config/reload
+curl -X POST localhost:8000/flags/new_ui/batch -H 'Content-Type: application/json' \
+  -d '{"subjects": ["vip-001", "user-1"]}'                  # 全部 enabled=false, reason=kill_switch
+
+# 坏名单整次拒绝：把名单写成字符串，reload 返回 422，服务仍是上一个好版本
+echo '{"flags": {"new_ui": {"enabled": true, "percentage": 30, "force_on": "oops"}}}' > config.json
+curl -X POST localhost:8000/config/reload                   # 422 type_mismatch
 ```
 
-测试覆盖：热更新失败保留旧版本、各类非法配置原因可区分、并发读写原子性、灰度边界（0/100/桶位边界）、分组稳定性与比例平滑扩张、密钥脱敏。
+测试覆盖：热更新失败保留旧版本、各类非法配置原因可区分、并发读写原子性、灰度边界（0/100/桶位边界）、分组稳定性与比例平滑扩张、密钥脱敏、**整体关闭与比例/名单叠加、两名单冲突以关闭为准、调比例不踢出名单外主体、坏名单整次拒绝、批量判定整批同版本、批量进行中热更新不串版本、空批次/重复主体/几千主体规模与 HTTP 入参校验**。`uv run pytest -s` 可看到每条用例打印的版本号与判定依据。

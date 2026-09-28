@@ -68,6 +68,11 @@ def dataclasses_asdict(obj: Any) -> dict[str, Any]:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
+    # 名单内部为 frozenset：规范化为排序后的列表，保证哈希稳定可复现
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
     return value
 
 
@@ -142,5 +147,32 @@ def _validate_flags(raw_flags: dict[str, Any], schema: ConfigSchema) -> dict[str
         if percentage != -1 and not (0 <= percentage <= 100):
             raise ConfigRejectionError(RejectionReason.ILLEGAL_VALUE, f"{path}.percentage",
                                        f"灰度比例 {percentage} 不在 0-100")
-        out[name] = FlagState(name=name, enabled=enabled, percentage=percentage)
+        force_on = _validate_subject_list(val.get("force_on", []), f"{path}.force_on")
+        force_off = _validate_subject_list(val.get("force_off", []), f"{path}.force_off")
+        kill_switch = val.get("kill_switch", False)
+        if not isinstance(kill_switch, bool):
+            raise ConfigRejectionError(RejectionReason.TYPE_MISMATCH, f"{path}.kill_switch",
+                                       f"期望 bool，实际 {type(kill_switch).__name__}")
+        out[name] = FlagState(
+            name=name,
+            enabled=enabled,
+            percentage=percentage,
+            force_on=force_on,
+            force_off=force_off,
+            kill_switch=kill_switch,
+        )
     return out
+
+
+def _validate_subject_list(raw: Any, path: str) -> frozenset[str]:
+    """校验强制名单：必须是字符串数组；任何元素类型不对都整次拒绝。"""
+    if not isinstance(raw, list):
+        raise ConfigRejectionError(
+            RejectionReason.TYPE_MISMATCH, path,
+            f"期望字符串数组，实际 {type(raw).__name__}")
+    for item in raw:
+        if not isinstance(item, str):
+            raise ConfigRejectionError(
+                RejectionReason.TYPE_MISMATCH, path,
+                f"名单元素必须全部为字符串，发现 {type(item).__name__}: {item!r}")
+    return frozenset(raw)

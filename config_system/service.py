@@ -7,6 +7,7 @@ import os
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .errors import ConfigRejectionError
 from .manager import ConfigManager
@@ -31,6 +32,11 @@ APP_SCHEMA = ConfigSchema(
 def build_default_manager() -> ConfigManager:
     file_path = os.environ.get("APP_CONFIG_FILE", "config.json")
     return ConfigManager(APP_SCHEMA, file_path=file_path)
+
+
+class BatchRequest(BaseModel):
+    # 主体列表；空列表合法（返回空结果），重复主体按位置各返回一条
+    subjects: list[str]
 
 
 def create_app(manager: ConfigManager | None = None) -> FastAPI:
@@ -80,5 +86,20 @@ def create_app(manager: ConfigManager | None = None) -> FastAPI:
                     decision["version"], name, subject,
                     decision["enabled"], decision["reason"])
         return decision
+
+    @app.post("/flags/{name}/batch")
+    def eval_flag_batch(name: str, req: BatchRequest):
+        """批量判定：整批只取一次快照，结果必然同版本。
+
+        200 返回 {"version", "flag", "results"}；
+        subjects 不是字符串数组时返回 422 type_mismatch。
+        """
+        # 进入处理即固定快照：即使期间发生热更新，本批也不会串版本
+        snap = mgr.current()
+        result = snap.decide_batch(name, req.subjects)
+        logger.info("flag batch decide: version=%s flag=%s count=%d reasons=%s",
+                    result["version"], name, len(result["results"]),
+                    {r["reason"] for r in result["results"]})
+        return result
 
     return app
