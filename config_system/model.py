@@ -44,31 +44,28 @@ class ConfigSnapshot:
     def decide(self, flag: str, subject: str | None = None) -> dict[str, Any]:
         """返回开关判定结果与判定依据（可解释）。
 
-        灰度模式（percentage >= 0）优先级从高到低：
+        所有开关（含未设比例的纯布尔开关）统一优先级，从高到低：
         1. kill_switch 整体关闭：对所有主体一律关闭（reason=kill_switch）；
         2. force_off 强制关闭名单：命中即关（同时在两个名单里也以关闭为准）；
         3. force_on 强制打开名单：命中即开；
-        4. 稳定桶位比例判定（reason=rollout_in/rollout_out）。
-        名单命中与比例无关，比例调整只影响名单外主体且只能进不能出。
+        4. 纯布尔开关（percentage < 0）：按 enabled 整体开/关
+           （reason=boolean_on/boolean_off）；
+        5. 灰度开关（percentage >= 0）：稳定桶位比例判定
+           （reason=rollout_in/rollout_out）。
+        名单命中与是否设比例无关；比例调整只影响名单外主体且只能进不能出。
         """
         state = self.flags.get(flag)
         base = {"version": self.version, "flag": flag}
         if state is None:
             return {**base, "enabled": False, "reason": "unknown_flag"}
-        if state.percentage < 0:
-            return {
-                **base,
-                "enabled": state.enabled,
-                "reason": "boolean_on" if state.enabled else "boolean_off",
-            }
         subj = subject if subject is not None else ""
-        # 1. 整体关闭优先级最高：忽略比例与名单
+        # 1. 整体关闭优先级最高：对纯布尔开关同样生效，忽略开/关、比例与名单
         if state.kill_switch:
             return {
                 **base, "enabled": False, "reason": "kill_switch",
                 "percentage": state.percentage, "subject": subj,
             }
-        # 2/3. 强制名单：关闭优先于打开
+        # 2/3. 强制名单：关闭优先于打开；对纯布尔开关同样生效
         if subj in state.force_off:
             return {
                 **base, "enabled": False, "reason": "force_off",
@@ -79,7 +76,14 @@ class ConfigSnapshot:
                 **base, "enabled": True, "reason": "force_on",
                 "percentage": state.percentage, "subject": subj,
             }
-        # 4. 比例桶位
+        # 4. 纯布尔开关：未设比例时按 enabled 整体开/关
+        if state.percentage < 0:
+            return {
+                **base,
+                "enabled": state.enabled,
+                "reason": "boolean_on" if state.enabled else "boolean_off",
+            }
+        # 5. 比例桶位
         bucket = stable_bucket(flag, subj, self.salt)
         on = bucket < state.percentage
         return {
