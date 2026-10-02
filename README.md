@@ -56,11 +56,11 @@ bucket = sha256("{salt}|{flag}|{subject}")[:16] % 100   # 0-99 共 100 桶
 - **稳定可复现**：同一主体在同一配置版本下判定恒定；盐（salt）为部署级常量、与版本号解耦，因此修改无关字段不会导致分组漂移。
 - **比例平滑**：按“桶位 < 比例”的前缀判定，比例从 p1 调大到 p2 时仅新增桶位 `[p1, p2)` 的主体，已开启者不被踢出，无大面积重新分组。
 - **可解释**：`GET /flags/{name}?subject=xxx` 返回 `version / enabled / reason / bucket / percentage`。
-- **纯布尔开关**：`percentage` 缺省（-1）时按 `enabled` 整体开/关，`reason` 为 `boolean_on / boolean_off`。
+- **纯布尔开关**：`percentage` 缺省（-1）时按 `enabled` 整体开/关，`reason` 为 `boolean_on / boolean_off`；`kill_switch` 与强制名单对纯布尔开关同样生效（见下节优先级）。
 
 ## 强制名单与一键全量关
 
-每个灰度开关在 `enabled + percentage` 之外还支持三个字段（均可选，老配置缺省行为不变）：
+每个开关（包括未设灰度比例的纯布尔开关）在 `enabled + percentage` 之外还支持三个字段（均可选，老配置缺省行为不变）：
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
@@ -68,22 +68,23 @@ bucket = sha256("{salt}|{flag}|{subject}")[:16] % 100   # 0-99 共 100 桶
 | `force_off` | `string[]` | 强制关闭名单：命中即关，与比例无关 |
 | `kill_switch` | `bool` | 一键全量关：`true` 时对所有主体一律关闭 |
 
-灰度模式下判定优先级**从高到低**固定为：
+所有开关（含没设比例的纯布尔开关）统一按以下优先级判定，**从高到低**固定为：
 
 ```
-1. kill_switch 整体关闭   -> enabled=false, reason=kill_switch   （忽略比例与名单）
+1. kill_switch 整体关闭   -> enabled=false, reason=kill_switch   （忽略比例、名单与 enabled）
 2. force_off 强制关闭名单 -> enabled=false, reason=force_off
 3. force_on  强制打开名单 -> enabled=true,  reason=force_on
-4. 稳定桶位比例判定       -> reason=rollout_in / rollout_out
+4. 开关自身状态           -> 纯布尔开关：boolean_on / boolean_off
+                             灰度开关：按稳定桶位比例 rollout_in / rollout_out
 ```
 
 由此保证的确定性语义：
 
-- **整体关闭优先级最高**：即使 `percentage=100` 且主体在 `force_on` 名单里，只要 `kill_switch=true` 一律关闭，且 `reason` 明确为 `kill_switch`，不会与“比例没选中”混淆；解除后恢复比例判定。
+- **整体关闭对所有开关生效**：无论开关设没设比例、名单里有没有人、`enabled` 是开是关，只要 `kill_switch=true` 一律关闭，且 `reason` 明确为 `kill_switch`，不会与“开关本来就是关的”（`boolean_off`）或“比例没选中”（`rollout_out`）混淆；解除后恢复开关原本的判定（纯布尔回到 `boolean_on/off`，灰度回到比例判定）。
+- **名单对所有开关生效**：`force_on` 能把关着的纯布尔开关对名单内主体打开，`force_off` 反之；名单命中与比例无关。
 - **冲突以关闭为准**：主体同时出现在两个名单里时结果恒为 `force_off`，不会反复横跳。
 - **名单稳定命中**：名单主体不受比例调整影响；比例调大只按前缀桶放入新主体，名单外已开启者不会被踢出。
 - **边界确定**：`percentage=0`（无名单、未整体关）对普通主体恒为 `rollout_out`，`percentage=100` 恒为 `rollout_in`；叠加 `kill_switch` / 名单后按上表优先级得到唯一结果。
-- **纯布尔开关不参与上述机制**：`percentage` 缺省的开关仍只看 `enabled`。
 
 名单本身写坏时（名单不是数组、元素不是字符串、`kill_switch` 不是布尔值、或写到了未声明的开关上），整次更新以 `422 type_mismatch` / `invalid_key` 拒绝，服务继续沿用上一个好版本，不会只生效一半。
 
@@ -122,7 +123,7 @@ POST /flags/new_ui/batch  {"subjects": ["vip-001", "user-1", "blocked-007"]}
 
 ## 兼容性
 
-- **老配置**：不含 `force_on / force_off / kill_switch` 的配置文件与环境变量层无需改动；三个字段缺省为空名单 / `false`，灰度与纯布尔开关行为与旧版完全一致（既有 39 个用例全部保留通过）。
+- **老配置**：不含 `force_on / force_off / kill_switch` 的配置文件与环境变量层无需改动；三个字段缺省为空名单 / `false`，只写 `enabled` 或只写 `enabled + percentage` 的老配置升级后行为与旧版完全一致（既有用例全部保留通过）。
 - **老接口**：`GET /flags/{name}`、`/config*` 的路径、方法与既有字段不变；单主体判定的旧 `reason`（`boolean_on/off`、`rollout_in/out`、`unknown_flag`）含义不变，本次仅**新增** `force_on / force_off / kill_switch` 三种 reason。`GET /config` 的开关视图额外带出三个新字段。
 - **环境变量层**：暂不支持通过环境变量设置名单（名单为数组形态），名单通过配置文件配置；`APP_FLAG_* / APP_ROLLOUT_*` 语义不变。
 
@@ -188,6 +189,26 @@ curl -X POST localhost:8000/flags/new_ui/batch -H 'Content-Type: application/jso
 # 坏名单整次拒绝：把名单写成字符串，reload 返回 422，服务仍是上一个好版本
 echo '{"flags": {"new_ui": {"enabled": true, "percentage": 30, "force_on": "oops"}}}' > config.json
 curl -X POST localhost:8000/config/reload                   # 422 type_mismatch
+
+# 纯布尔开关（不写 percentage）同样受整体关闭与名单约束
+cat > config.json <<'JSON'
+{
+  "flags": {
+    "new_ui": {"enabled": true, "force_on": ["vip-001"], "kill_switch": false}
+  }
+}
+JSON
+curl -X POST localhost:8000/config/reload
+curl 'localhost:8000/flags/new_ui?subject=vip-001'     # force_on（无比例也命中名单）
+curl 'localhost:8000/flags/new_ui?subject=user-1'      # boolean_on
+# 整体关闭：reason 明确为 kill_switch，与 boolean_off 可区分
+sed -i 's/"kill_switch": false/"kill_switch": true/' config.json
+curl -X POST localhost:8000/config/reload
+curl 'localhost:8000/flags/new_ui?subject=vip-001'     # enabled=false, reason=kill_switch
+# 解除后回到开关原本状态
+sed -i 's/"kill_switch": true/"kill_switch": false/' config.json
+curl -X POST localhost:8000/config/reload
+curl 'localhost:8000/flags/new_ui?subject=user-1'      # boolean_on
 ```
 
-测试覆盖：热更新失败保留旧版本、各类非法配置原因可区分、并发读写原子性、灰度边界（0/100/桶位边界）、分组稳定性与比例平滑扩张、密钥脱敏、**整体关闭与比例/名单叠加、两名单冲突以关闭为准、调比例不踢出名单外主体、坏名单整次拒绝、批量判定整批同版本、批量进行中热更新不串版本、空批次/重复主体/几千主体规模与 HTTP 入参校验**。`uv run pytest -s` 可看到每条用例打印的版本号与判定依据。
+测试覆盖：热更新失败保留旧版本、各类非法配置原因可区分、并发读写原子性、灰度边界（0/100/桶位边界）、分组稳定性与比例平滑扩张、密钥脱敏、**整体关闭与比例/名单叠加、两名单冲突以关闭为准、调比例不踢出名单外主体、坏名单整次拒绝、批量判定整批同版本、批量进行中热更新不串版本、空批次/重复主体/几千主体规模与 HTTP 入参校验**，以及**纯布尔开关（未设比例）叠加整体关闭/强制名单、名单冲突以关闭为准、整体关闭解除后恢复布尔状态、只写 enabled 的老配置行为不变、纯布尔开关上字段写坏整次拒绝**。`uv run pytest -s` 可看到每条用例打印的版本号与判定依据。
